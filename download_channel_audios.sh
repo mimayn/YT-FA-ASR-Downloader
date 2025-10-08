@@ -4,12 +4,28 @@
 # Usage:
 #   Single DB:
 #     ./download_channel_audios.sh /path/to/channel.db [audio_subdir]
+#     ./download_channel_audios.sh --only_subtitled /path/to/channel.db [audio_subdir]
 #   DB list file:
 #     ./download_channel_audios.sh --db-list /path/to/list.txt [audio_subdir]
+#     ./download_channel_audios.sh --db-list --only_subtitled /path/to/list.txt [audio_subdir]
 #   - audio_subdir defaults to 'audio' and is created next to each DB
+#   - --only_subtitled: only download audios for videos that have downloaded subtitles
 
+ONLY_SUBTITLED=false
 MODE="single"
-if [ "${1:-}" = "--db-list" ]; then
+
+# Parse arguments
+if [ "${1:-}" = "--only_subtitled" ]; then
+    ONLY_SUBTITLED=true
+    if [ "${2:-}" = "--db-list" ]; then
+        MODE="list"
+        DB_LIST_FILE="${3:-}"
+        AUDIO_SUBDIR="${4:-audio}"
+    else
+        DB_PATH="${2:-}"
+        AUDIO_SUBDIR="${3:-audio}"
+    fi
+elif [ "${1:-}" = "--db-list" ]; then
     MODE="list"
     DB_LIST_FILE="${2:-}"
     AUDIO_SUBDIR="${3:-audio}"
@@ -21,7 +37,9 @@ fi
 if [ "$MODE" = "single" ]; then
     if [ -z "$DB_PATH" ]; then
         echo "Usage: $0 /path/to/channel.db [audio_subdir]" >&2
+        echo "   or: $0 --only_subtitled /path/to/channel.db [audio_subdir]" >&2
         echo "   or: $0 --db-list /path/to/list.txt [audio_subdir]" >&2
+        echo "   or: $0 --db-list --only_subtitled /path/to/list.txt [audio_subdir]" >&2
         exit 1
     fi
     if [ ! -f "$DB_PATH" ]; then
@@ -31,6 +49,7 @@ if [ "$MODE" = "single" ]; then
 else
     if [ -z "$DB_LIST_FILE" ]; then
         echo "Usage: $0 --db-list /path/to/list.txt [audio_subdir]" >&2
+        echo "   or: $0 --db-list --only_subtitled /path/to/list.txt [audio_subdir]" >&2
         exit 1
     fi
     if [ ! -f "$DB_LIST_FILE" ]; then
@@ -100,6 +119,30 @@ is_downloaded() {
     grep -q "^$video_id$" "$DOWNLOADED_VIDEOS" 2>/dev/null
 }
 
+# Function to get all videos with downloaded subtitles
+get_subtitled_videos() {
+    local base_dir="$1"
+    local subtitled_videos=""
+    
+    # Find all completed_*_*_subs.txt files in the base directory
+    for completed_file in "$base_dir"/completed_*_*_subs.txt; do
+        if [ -f "$completed_file" ]; then
+            # Extract video IDs from each completed file and add to our list
+            if [ -n "$subtitled_videos" ]; then
+                subtitled_videos="$subtitled_videos
+$(cat "$completed_file" 2>/dev/null || true)"
+            else
+                subtitled_videos="$(cat "$completed_file" 2>/dev/null || true)"
+            fi
+        fi
+    done
+    
+    # Remove duplicates and return unique video IDs
+    if [ -n "$subtitled_videos" ]; then
+        echo "$subtitled_videos" | sort -u
+    fi
+}
+
 # Function to check if video is known to be deleted
 is_deleted() {
     local video_id=$1
@@ -159,7 +202,7 @@ download_video() {
         log "Attempt $attempt for $video_id"
         
         if yt-dlp \
-            --cookies-from-browser firefox \
+            --cookies-from-browser chrome \
             -x --audio-format mp3 \
             --audio-quality 0 \
             --format "bestaudio[ext=m4a]" \
@@ -199,7 +242,11 @@ process_db() {
     init_for_db "$1"
 
     # Main execution
-    log "Starting download process..."
+    if [ "$ONLY_SUBTITLED" = true ]; then
+        log "Starting download process (--only_subtitled mode: only videos with downloaded subtitles)..."
+    else
+        log "Starting download process..."
+    fi
 
     # Load previous progress
     progress_info=$(load_progress)
@@ -219,11 +266,51 @@ process_db() {
         video_ids=$(sqlite3 "$DB" "SELECT rowid, video_id FROM videos ORDER BY rowid")
     fi
 
+    # If --only_subtitled flag is used, filter to only videos with downloaded subtitles
+    if [ "$ONLY_SUBTITLED" = true ]; then
+        log "Filtering to only videos with downloaded subtitles..."
+        subtitled_videos=$(get_subtitled_videos "$BASE_DIR")
+        
+        if [ -z "$subtitled_videos" ]; then
+            log "No videos with downloaded subtitles found. Exiting."
+            return 0
+        fi
+        
+        # Create a temporary file with subtitled video IDs for filtering
+        temp_subtitled_file=$(mktemp)
+        echo "$subtitled_videos" > "$temp_subtitled_file"
+        
+        # Filter the video_ids to only include those with subtitles
+        filtered_video_ids=""
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            video_id=$(echo "$line" | cut -d'|' -f2)
+            if grep -q "^$video_id$" "$temp_subtitled_file" 2>/dev/null; then
+                if [ -n "$filtered_video_ids" ]; then
+                    filtered_video_ids="$filtered_video_ids
+$line"
+                else
+                    filtered_video_ids="$line"
+                fi
+            fi
+        done <<< "$video_ids"
+        
+        video_ids="$filtered_video_ids"
+        rm -f "$temp_subtitled_file"
+        
+        subtitled_count=$(echo "$subtitled_videos" | wc -l)
+        log "Found $subtitled_count videos with downloaded subtitles"
+    fi
+
     total_videos=$(sqlite3 "$DB" "SELECT COUNT(*) FROM videos")
     remaining_videos=$(echo "$video_ids" | wc -l)
 
     log "Total videos in database: $total_videos"
-    log "Videos to process: $remaining_videos"
+    if [ "$ONLY_SUBTITLED" = true ]; then
+        log "Videos with subtitles: $remaining_videos"
+    else
+        log "Videos to process: $remaining_videos"
+    fi
     log "Already downloaded (from log): $(wc -l < "$DOWNLOADED_VIDEOS" 2>/dev/null || echo 0)"
     log "Known deleted videos: $(wc -l < "$DELETED_VIDEOS" 2>/dev/null || echo 0)"
 

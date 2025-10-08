@@ -50,10 +50,7 @@ DB=""
 LOG_FILE=""
 ERROR_LOG=""
 FAILED_FILE=""
-DELETED_VIDEOS=""
-NO_CAPTIONS_FILE=""
 TEMP_UNAVAILABLE_FILE=""
-GEO_BLOCKED_FILE=""
 
 init_for_db() {
     local db_path_local="$1"
@@ -63,12 +60,9 @@ init_for_db() {
     LOG_FILE="$BASE_DIR/subs_download_log.txt"
     ERROR_LOG="$BASE_DIR/subs_download_errors.txt"
     FAILED_FILE="$BASE_DIR/subs_failed.txt"
-    DELETED_VIDEOS="$BASE_DIR/subs_deleted_videos.txt"
-    NO_CAPTIONS_FILE="$BASE_DIR/no_captions_videos.txt"
     TEMP_UNAVAILABLE_FILE="$BASE_DIR/temp_unavailable_videos.txt"
-    GEO_BLOCKED_FILE="$BASE_DIR/geo_blocked_videos.txt"
     mkdir -p "$TARGET_DIR"
-    touch "$LOG_FILE" "$ERROR_LOG" "$FAILED_FILE" "$DELETED_VIDEOS" "$NO_CAPTIONS_FILE" "$TEMP_UNAVAILABLE_FILE" "$GEO_BLOCKED_FILE"
+    touch "$LOG_FILE" "$ERROR_LOG" "$FAILED_FILE" "$TEMP_UNAVAILABLE_FILE" 
 }
 
 # Ensure yt-dlp is available and reasonably up-to-date (best effort)
@@ -134,23 +128,13 @@ should_skip_download() {
     is_completed "$video_id" "$lang" "$kind" || is_nonexistent "$video_id" "$lang" "$kind"
 }
 
-is_deleted() {
-    local video_id=$1
-    grep -q "^$video_id$" "$DELETED_VIDEOS" 2>/dev/null
-}
-
-mark_deleted() {
-    local video_id=$1
-    echo "$video_id" >> "$DELETED_VIDEOS"
-}
 
 quick_video_check() {
     local video_id=$1
     local url="https://www.youtube.com/watch?v=$video_id"
     local error_output
     if yt-dlp \
-        --cookies-from-browser firefox \
-        --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+        --cookies-from-browser chrome \
         --quiet \
         --no-warnings \
         --skip-download \
@@ -160,19 +144,15 @@ quick_video_check() {
         return 0
     else
         error_output=$(yt-dlp \
-            --cookies-from-browser firefox \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --cookies-from-browser chrome \
             --quiet \
             --no-warnings \
             --skip-download \
             --retries 2 \
             --socket-timeout 15 \
             --print title "$url" 2>&1)
-        # GEO/region block or age/gated/verify glitches as temp
-        if echo "$error_output" | grep -qi "geo\|region\|country"; then
-            echo "$video_id" >> "$GEO_BLOCKED_FILE"
-            return 2
-        fi
+
+
         # Bot-check / rate limit / network as temporary
         if echo "$error_output" | grep -qi "confirm you're not a bot\|Please try again later\|HTTP Error 4\|HTTP Error 5\|timeout\|temporarily unavailable\|rate limit"; then
             echo "$video_id" >> "$TEMP_UNAVAILABLE_FILE"
@@ -194,7 +174,7 @@ has_any_captions() {
     local url="https://www.youtube.com/watch?v=$video_id"
     # Query metadata; if either field contains entries, captions exist
     local json_output
-    json_output=$(yt-dlp --cookies-from-browser firefox --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" -J "$url" 2>/dev/null || true)
+    json_output=$(yt-dlp --cookies-from-browser chrome -J "$url" 2>/dev/null || true)
     # If yt-dlp completely fails, assume unknown (treat as has captions to attempt download)
     if [ -z "$json_output" ]; then
         return 0
@@ -257,8 +237,7 @@ download_subs_for_lang() {
         
         # Capture yt-dlp output to check for specific errors
         local yt_dlp_output=$(yt-dlp \
-            --cookies-from-browser firefox \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --cookies-from-browser chrome \
             --quiet \
             --no-warnings \
             --skip-download \
@@ -327,7 +306,6 @@ process_db() {
     total_videos=$(sqlite3 "$DB" "SELECT COUNT(*) FROM videos")
 
     log "Total videos in database: $total_videos"
-    log "Known deleted videos: $(wc -l < "$DELETED_VIDEOS" 2>/dev/null || echo 0)"
 
     # Normalize languages into array
     IFS=',' read -r -a LANGS <<< "$LANGS_CSV"
@@ -362,39 +340,16 @@ process_db() {
             continue
         fi
 
-        # Only now do network checks when processing is needed
-        # Check known deleted
-        if is_deleted "$video_id"; then
-            log "Skipping $video_id - found in deleted log"
-            skipped_count=$((skipped_count + 1))
-            continue
-        fi
 
         # Quick existence check with classification
         quick_video_check "$video_id"
         qvc_status=$?
         if [ $qvc_status -eq 1 ]; then
             log "Video $video_id appears permanently unavailable - marking as deleted and skipping"
-            mark_deleted "$video_id"
             skipped_count=$((skipped_count + 1))
             continue
         elif [ $qvc_status -eq 2 ]; then
             log "Video $video_id temporarily unavailable (geo/rate/bot) - will retry next runs"
-            skipped_count=$((skipped_count + 1))
-            continue
-        fi
-
-        # Skip videos known to have no captions
-        if grep -q "^$video_id$" "$NO_CAPTIONS_FILE" 2>/dev/null; then
-            log "Skipping $video_id - previously marked as having no captions"
-            skipped_count=$((skipped_count + 1))
-            continue
-        fi
-
-        # Detect if video has any captions (manual or auto) before attempting downloads
-        if ! has_any_captions "$video_id"; then
-            log "No captions detected for $video_id - recording and skipping"
-            echo "$video_id" >> "$NO_CAPTIONS_FILE"
             skipped_count=$((skipped_count + 1))
             continue
         fi
@@ -415,22 +370,18 @@ process_db() {
         # Periodic status
         if [ $((processed_count % 10)) -eq 0 ]; then
             failed_count=$(wc -l < "$FAILED_FILE" 2>/dev/null || echo 0)
-            deleted_count=$(wc -l < "$DELETED_VIDEOS" 2>/dev/null || echo 0)
-            log "Progress: Processed $processed_count videos, skipped $skipped_count, $failed_count failed, $deleted_count deleted"
+            log "Progress: Processed $processed_count videos, skipped $skipped_count, $failed_count failed," 
         fi
     done <<< "$video_rows"
 
     # Final statistics
     failed_count=$(wc -l < "$FAILED_FILE" 2>/dev/null || echo 0)
-    deleted_count=$(wc -l < "$DELETED_VIDEOS" 2>/dev/null || echo 0)
 
     log "Subtitles download completed"
     log "Processed videos: $processed_count"
     log "Skipped videos: $skipped_count"
     log "Failed downloads: $failed_count"
-    log "Deleted/unavailable videos: $deleted_count"
     log "Failed entries saved in $FAILED_FILE"
-    log "Deleted video IDs saved in $DELETED_VIDEOS"
     log "Completed subtitles tracked in completed_*_*_subs.txt files"
     log "Nonexistent subtitles tracked in nonexistent_*_*_subs.txt files"
 }
@@ -445,7 +396,7 @@ else
         [ -z "$db_line_trimmed" ] && continue
         [[ "$db_line_trimmed" =~ ^# ]] && continue
         if [ -f "$db_line_trimmed" ]; then
-            echo "\n===== Processing DB: $db_line_trimmed ====="
+            echo "\\n===== Processing DB: $db_line_trimmed ====="
             process_db "$db_line_trimmed"
         else
             echo "Skipping missing DB path: $db_line_trimmed" >&2
